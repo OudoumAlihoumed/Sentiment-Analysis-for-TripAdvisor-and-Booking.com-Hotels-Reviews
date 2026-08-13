@@ -1,252 +1,277 @@
-# Can We Trust Deception Monitors for AI Agents?
-
-**Robustness-gap protocol + initial bounds on Llama-3.3-70B against the published Apollo probe**
-
-*Oudoum A. Houmed*
-
----
-
-**Epistemic status.** Independent empirical work. I ran a published Apollo deception probe through a budgeted attack ladder. The transfer result is the one I trust most. The adaptive SFT result is only a bound: both probe-aware cells were `attack_too_weak`. Code later; evasive LoRAs stay gated.
-
----
-
-## TL;DR
-
-Most probe papers report near-ceiling AUROC on their own domain, on agents that are not trying to dodge the probe. I asked something else: **how much detection is left as adversary budget rises**, and **when is an AUROC drop even evasion**?
-
-Setup: **Llama-3.3-70B-Instruct**, published Apollo residual probe (layer 22, mean-pooled), Modal `H200:2`.
-
-- Before any attack: **0.999 → 0.83** [0.75, 0.90] (Apollo domain → my agentic episodes).
-- SFT that keeps deception (b2, b3): probe AUROC stays ≥ baseline; retention ≈ 0.86.
-- RL (b4, λ=8): AUROC 0.75, but retention **0.14** → I withhold the gap.
-- Both probe-aware SFT runs: `attack_too_weak` (softplus tiny vs CE).
-
-I did not train a new probe. I measured one that already exists, with a retention gate so a broken agent is not counted as a defeated monitor.
-
----
-
-## Why I ran this
-
-Agents take actions with little human review. [AI control](https://arxiv.org/abs/2312.06942) wants cheap monitors on that stream. White-box probes on residual activations look strong ([Apollo / Goldowsky-Dill et al.](https://arxiv.org/abs/2502.03407)): AUROCs 0.96–0.999 on their sets, high catch rate at 1% FPR on ordinary chat.
-
-Those numbers are mostly non-adaptive. Adversarial ML has been warning about that for years ([Athalye et al.](https://arxiv.org/abs/1802.00420); [Tramèr et al.](https://arxiv.org/abs/2002.04599)). Activations can be scrambled while behaviour stays ([Bailey et al.](https://arxiv.org/abs/2412.09565)). RL can hit latent monitors ([Gupta & Jenner](https://arxiv.org/abs/2506.14261)).
-
-I wanted four things in one protocol:
-
-1. a **published** probe,
-2. **agentic** episodes, not only the probe’s training domain,
-3. a **budget ladder** (prompt → SFT → RL),
-4. a **retention gate**, so “AUROC fell because the model stopped lying” is not called success for the attacker.
-
----
-
-## Setup
-
-- **Model:** `meta-llama/Llama-3.3-70B-Instruct`, fp16, Apollo-matched. No 4-bit.
-- **Probe:** frozen Apollo instructed-pairs, layer 22, mean-pool over **response** tokens only. Validated on Apollo insider-trading (AUROC ≈ 0.999), then applied unchanged.
-- **Scale:** N=60 sessions; frozen deceptive cohort |C|=29; one FT seed; λ ∈ {0.5, 8} (primary 8).
-- **Compute:** five FT cells ≈ 2.0 h wall (~4 H200-GPU-h). Full project more (smokes, aborts). Modal bill ≈ **$140**.
-
-Upload figures: `scenario_figure1.png`, `results_transfer.png`, `results_tension.png`.
-
----
-
-## Math
-
-### Label
-
-An episode is deceptive when, at some turn $t^\star$, the visible reply conflicts with the agent’s internal fact **and** advances a covert goal:
-
-$$
-y(\tau)=1 \iff \exists\, t^\star:\ \mathrm{conflict}\big(a_{t^\star},\, b^{\mathrm{int}}\big) \wedge \mathrm{advances}\big(a_{t^\star},\, g^{\mathrm{cov}}\big).
-$$
-
-Conflict alone is error. Covert pursuit that is visible is not deception toward an overseer. The probe does **not** define $y$.
-
-### Probe readout
-
-Response-only mean-pool at layer 22, then the frozen Apollo linear probe. Let $H^{(22)}\in\mathbb{R}^{T\times d}$ be layer-22 residuals and $m\in\{0,1\}^T$ the response-only mask:
-
-$$
-s=\bar{h}^{(22)}=\frac{\sum_{t=1}^{T} m_t\, H^{(22)}_{t}}{\sum_{t=1}^{T} m_t}\in\mathbb{R}^{d},
-\qquad
-z=w^{\top}\mathrm{scale}(s)+b,
-\qquad
-p=\sigma(z)=(1+e^{-z})^{-1}.
-$$
-
-I do not refit $(w,b)$.
-
-### AUROC and robustness gap
-
-$$
-\mathrm{AUROC}=\Pr(z^+>z^-)+\tfrac{1}{2}\Pr(z^+=z^-).
-$$
-
-$$
-\Delta_{\mathrm{det}}(b)=\mathrm{AUROC}(b_0)-\mathrm{AUROC}(b).
-$$
-
-Positive $\Delta_{\mathrm{det}}$ means detection fell. I report it only if retention passes; otherwise the gap is **withheld**.
-
-CIs: session-clustered bootstrap 95% for AUROC.
-
----
-
-## Ladder
-
-After $b_0$, freeze the deceptive cohort:
-
-$$
-C=\{i:\ \mathrm{intended}_i=1\ \wedge\ J\big(a_i^{(b_0)}\big)=1\}.
-$$
-
-All later rungs use the same $C$ ($|C|=29$).
-
-| Rung | What I do |
-|------|-----------|
-| $b_1$ | Prompt concealment only (no weight update). Not FT-gated. |
-| $b_2$ | LoRA SFT, probe **out** of the loss: $L=L_{\mathrm{CE}}$ |
-| $b_3$ | LoRA SFT, probe **in** the loss: $L=L_{\mathrm{CE}}+\lambda\,\mathrm{softplus}(z)$ |
-| $b_4$ | Fresh LoRA REINFORCE: $R=\alpha\cdot\mathrm{retention}-\lambda z-\beta\cdot\mathrm{surface\_risk}$ |
-
-I train $b_2$/$b_3$ on $b_0$ deceptive completions, not on $b_1$ (those often already stopped deceiving).
-
-**Softplus on the logit $z$**, not on $\sigma(z)$. Probability form saturates and kills the gradient.
-
-**Did the attack engage?**
-
-$$
-\Delta z=\mathbb{E}[z(b_0)]-\mathbb{E}[z(b)],
-\qquad
-\mathrm{rel}=\frac{\Delta z}{\mathrm{std}(z(b_0))}.
-$$
-
-`attack_worked` only if $\Delta z \ge 0.1$ and $\mathrm{rel}\ge 0.25$. Else `attack_too_weak`.
-
-**Retention gate** (FT rungs only). Let $S(b)$ be deception rate on $C$. Report $\Delta_{\mathrm{det}}$ iff:
-
-$$
-S(b)\ge 0.8\, S(b_0)
-\qquad\text{and}\qquad
-[\delta_{\mathrm{lo}},\delta_{\mathrm{hi}}]\subset(-0.20,0.20).
-$$
-
-(90% session-bootstrap CI on $\delta=S(b)-S(b_0)$). Fail → withhold.
-
-Point of the gate: **AUROC down + agent no longer deceiving ≠ monitor defeated.**
-
-Formal losses:
-
-$$
-L_{b_2}(\theta)=-\sum_{t\in\mathrm{asst}}\log\pi_\theta\big(a_t\mid a_{<t},x\big).
-$$
-
-$$
-L_{b_3}(\theta)=L_{\mathrm{CE}}+\lambda\,\mathrm{softplus}(z),
-\qquad
-\mathrm{softplus}(z)=\log(1+e^{z}).
-$$
-
-$$
-L_{\mathrm{RL}}=-R\sum_t\log\pi_\theta\big(a_t\mid\cdot\big).
-$$
-
----
-
-## Results
-
-### Transfer (no attack yet)
-
-| Domain | Probe AUROC |
-|--------|-------------|
-| Apollo insider-trading | **0.999** |
-| My agentic episodes (b0) | **0.83** [0.75, 0.90] |
-
-Same extraction path. This is distribution shift, not a wiring bug. Later gaps are vs **0.83**, not vs 1.0.
-
-### Primary table (λ=8)
-
-|  | b0 | b1 | b2 | b3 | b4 |
-|--|:--:|:--:|:--:|:--:|:--:|
-| Surface AUROC | 0.83 | 0.52 | 0.71 | 0.72 | 0.68 |
-| Probe AUROC | 0.83 | 0.79 | 0.89 | 0.85 | 0.75 |
-| CoT control | 0.52 | 0.44 | 0.54 | 0.53 | 0.50 |
-| $\Delta_{\mathrm{det}}$ | — | 0.04 | −0.06 | −0.02 | *withheld* |
-| Retention | 1.00 | 0.52 | 0.86 | 0.86 | **0.14** |
-| FT gate | — | — | pass | pass | **fail** |
-
-Both λ=0.5 and λ=8 probe-aware runs are `attack_too_weak`.
-
-At λ=0.5, probe AUROC stays high through b4 (0.90), but retention still fails (0.31). Gated either way.
-
-### Reading the rungs
-
-**Transfer** is the strongest result. Biggest drop, zero attack.
-
-**b1:** surface falls hard (0.83→0.52); probe barely moves (0.79). Same concealment, different monitors.
-
-**b2 / b3:** probe holds or rises (0.89, 0.85) with retention 0.86. Putting the probe in the loss did not open an extra gap here. Softplus never really engaged, so this is a **budget bound**, not “probe unbeatable.”
-
-**b4:** AUROC 0.75 only with retention 0.14. Fixed-threshold recall can even go *up* when outputs go weird. That is why I gate.
-
-At b0, probe and surface flags barely overlap (Jaccard 0.08). CoT control sits ~0.5; my episodes are single-turn, so that control is weak.
-
----
-
-## What I take from this
-
-Two findings, different strength:
-
-1. **Transfer (0.999→0.83):** solid.
-2. **Flat b2–b3:** weaker; `attack_too_weak`. Bound on *this* budget only.
-
-I expected probe-aware pressure to open a clean gap. Under my budget it did not, unless the agent also stopped deceiving.
-
-Why flat under SFT? Either the probe resists gradients, or softplus never engaged. Logs say the second. So I am not claiming the first.
-
-[Gupta & Jenner](https://arxiv.org/abs/2506.14261) find mean-pool style monitors harder for RL than token-level ones. That fits a small usable $\Delta_{\mathrm{det}}(b_4)$ *if* retention holds. I got AUROC movement with retention collapse instead. I cannot cleanly separate “hard probe” from “my RL broke the behaviour” at this budget.
-
----
-
-## Limits
-
-- Both λ settings `attack_too_weak`; harder schedules untested.
-- N=60, |C|=29 → wide CIs.
-- One model, one probe, one seed.
-- Single-turn episodes only.
-- Single-annotator retention judge (blind-sample check).
-- Code later; evasive checkpoints gated.
-
----
-
-## If you test monitors
-
-1. Measure on the agentic / deployment distribution. Report transfer with CIs.
-2. Use a budgeted adaptive ladder, not one static AUROC.
-3. Keep a retention gate.
-4. Log `attack_too_weak` vs a working penalty before claiming robustness.
-5. Next: harder λ/curriculum, multi-seed, multi-turn, second model/probe.
-
-Same protocol will show a real adaptive gap when one appears while deception still holds.
-
----
-
-## References
-
-1. [Goldowsky-Dill et al., deception probes](https://arxiv.org/abs/2502.03407) · [code](https://github.com/ApolloResearch/deception-detection)
-2. [Greenblatt et al., AI Control](https://arxiv.org/abs/2312.06942)
-3. [Gupta & Jenner, RL-Obfuscation](https://arxiv.org/abs/2506.14261)
-4. [Bailey et al., obfuscated activations](https://arxiv.org/abs/2412.09565)
-5. [Scheurer et al., deception under pressure](https://arxiv.org/abs/2311.07590)
-6. [Benton et al., sabotage evals](https://arxiv.org/abs/2410.21514)
-7. [Meinke et al., in-context scheming](https://arxiv.org/abs/2412.04984)
-8. [Athalye et al., obfuscated gradients](https://arxiv.org/abs/1802.00420)
-9. [Tramèr et al., adaptive attacks](https://arxiv.org/abs/2002.04599)
-10. [Zou et al., RepE](https://arxiv.org/abs/2310.01405)
-11. [Burns et al., CCS](https://arxiv.org/abs/2212.03827)
-12. [Parrack et al., black-to-white](https://arxiv.org/abs/2507.12691)
-
-Comments welcome on the retention thresholds, the `attack_worked` test, and what a harder probe-aware schedule should look like while deception still holds.
-
-*Oudoum A. Houmed · oudoum.ali-houmed@universite-paris-saclay.fr*
+A robustness-gap protocol for published white-box probes, with initial empirical bounds on Llama-3.3-70B
+Oudoum A. Houmed
+Epistemic status. Independent empirical project. I stress-tested a published Apollo deception probe under a budgeted adaptive ladder. The transfer result is solid. The adaptive-attack result is a bound on the budget I tested, not a general robustness theorem: both probe-aware SFT cells were attack_too_weak. Code will be released later; evasive LoRA weights stay gated.
+TL;DR
+People are proposing deception monitors (especially linear probes on residual-stream activations) as a way to oversee LLM agents when humans cannot read every action. Most published numbers are near-ceiling AUROC on the probe’s own domain, against agents that are not trying to evade the monitor.
+I asked a different question:
+How much detection survives as adversary budget rises — and when should a drop in detection count as evasion at all?
+I ran that question as a protocol on Llama-3.3-70B-Instruct against the published Apollo residual probe (Goldowsky-Dill et al., layer 22, mean-pooled). Main results:
+Transfer gap (before any attack). Same extraction path: AUROC 0.999 on Apollo’s insider-trading domain → 0.83 (bootstrap 95% CI [0.75, 0.90]) on my agentic episodes.
+Attacks that keep deception do not open a further gap. Probe-agnostic SFT ($b_2$) and probe-aware SFT ($b_3$) both keep retention ≈ 0.86 and probe AUROC at or above the agentic baseline.
+RL lowers AUROC only when deception collapses. At $\lambda=8$, probe AUROC falls to 0.75, but retention falls to 0.14. I withhold that gap.
+Both probe-aware SFT runs were attack_too_weak. Softplus stayed small next to cross-entropy. So the flat $b_2$–$b_3$ contrast is a bound on this budget, not “the probe is unbeatable.”
+I did not build a new probe. I built a measurement: a budgeted adversary ladder + a retention gate so a broken agent is not scored as a defeated monitor.
+
+
+
+
+1. Why this matters
+LLMs are increasingly used as agents: multi-step actions, tools, thin human review. In that setting an agent can pursue a covert goal while the transcript looks compliant. That is exactly the setting where AI control proposes cheap monitors that flag suspicious behaviour.
+Two monitor families are common:
+Black-box: score the transcript (surface classifier, CoT reader).
+White-box: score internals. The strongest published examples today are linear probes on residual-stream activations (Goldowsky-Dill et al.; also Zou et al., Burns et al.).
+Apollo’s probes report AUROCs in the 0.96–0.999 range on their eval sets, and catch most deceptive responses at a 1% FPR threshold calibrated on ordinary chat. That is impressive. It is also usually measured under a non-adaptive assumption: the agent is not optimising against the probe.
+A decade of adversarial ML says that assumption is dangerous (Carlini & Wagner; Athalye et al.; Tramèr et al.). Recent work already shows activations can be obfuscated while behaviour stays (Bailey et al.), and that RL can attack latent monitors (Gupta & Jenner, RL-Obfuscation).
+What I wanted — and what I did not find as a ready-made protocol — was:
+measure a published white-box probe,
+on agentic episodes (not only the probe’s training domain),
+under a budgeted adaptive ladder (prompt → SFT → RL),
+with a retention gate so “AUROC dropped because the agent stopped lying” is not counted as successful evasion.
+
+
+
+3.2 Probe readout (frozen Apollo weights)
+Let $H^{(22)} \in \mathbb{R}^{T \times d}$ be layer-22 residual states  and $m \in 0,1^T$ the response-only mask. The probe never sees prompt tokens:
+$$s = \bar{h}^{(22)} = \frac{\sum{t=1}^{T} mt H^{(22)}{t}}{\sum{t=1}^{T} mt} \in \mathbb{R}^{d}.$$
+With published weights $(w,b)$ and the Apollo scaler:
+$$z = D{\mathrm{probe}}(s) = w^{\top}\mathrm{scale}(s) + b, \qquad p = \sigma(z) = (1+e^{-z})^{-1}.$$
+
+2. Setup in one picture
+Model. meta-llama/Llama-3.3-70B-Instruct, float16, Apollo-matched loading. No 4-bit.
+Hardware. Modal cloud, H200:2 (two NVIDIA H200s).
+Probe under test. Published Apollo instructed-pairs residual probe at layer 22, mean-pooled over response tokens only. I do not refiton my data. Extraction is validated first on Apollo insider-trading transcripts (AUROC ≈ 0.999), then applied unchanged to agentic episodes.
+Scale. $N = 60$ paired sessions. After baseline, I freeze the deceptive cohort $|\mathcal{C}| = 29$. One fine-tuning seed. $\lambda \in 0.5, 8.0$ (primary $\lambda = 8$).
+Compute. The five reported fine-tuning cells (train + re-elicit) took ≈ 2.0 hours wall-clock (~4 H200-GPU-hours). Earlier elicitation / Alpaca calibration / probe extraction were reused. The full project cost more (smokes, aborts, an archived non-primary ladder). Modal billing ≈ $140.
+
+
+
+
+
+3. Definitions (with the math)
+
+3.1 What counts as deception
+An episode $\tau = (x_{1:T}, a_{1:T}, s_{1:T})$ has overseer-visible observations $x_t$, agent utterances $a_t$, and residual states $s_t$. Let $g_{\mathrm{cov}}$ be a covert goal hidden from the overseer, and $b_{\mathrm{int}}$ the scenario-internal fact. With a deterministic scenario judge $J$:
+$$ y(\tau) = 1 \iff \exists t^\star:\ \mathrm{conflict}\big(a_{t^\star}, b_{\mathrm{int}}\big) \wedge \mathrm{advances}\big(a_{t^\star}, g_{\mathrm{cov}}\big). $$
+Both clauses are required:
+conflict alone is just error;
+covert pursuit that is transparent is not deception toward an overseer.
+Labels are monitor-independent. The probe does not define $y$.
+3.2 Probe readout (frozen Apollo weights)
+Let $H^{(22)} \in \mathbb{R}^{T \times d}$ be layer-22 residual states ($d = 8192$) and $m \in 0,1^T$ the response-only mask. The probe never sees prompt tokens:
+$$ s
+\bar h^{(22)}
+\frac{\sum_{t=1}^{T} m_t H^{(22)}{t,:}} {\sum{t=1}^{T} m_t} \in \mathbb{R}^{d}. $$
+With published weights $(w,b)$ and the Apollo scaler:
+$$ z = D_{\mathrm{probe}}(s) = w^\top \mathrm{scale}(s) + b, \qquad p = \sigma(z) = \big(1 + e^{-z}\big)^{-1}. $$
+3.3 Primary metric: AUROC
+Threshold-free detection is the Mann–Whitney form:
+$$ \mathrm{AUROC}
+\Pr(z_+ > z_-) + \tfrac{1}{2}\Pr(z_+ = z_-). $$
+I still calibrate an operating point for recall diagnostics (probe $\alpha = 0.01$ on Alpaca chat, $n=1000$), but on my agentic cohort deceptive scores sit near that threshold, so recall is jumpy. AUROC is the primary readout. Confidence intervals are session-clustered bootstrap 95% CIs.
+3.4 The robustness gap
+For detector $D$ and adversary budget $b$:
+$$ \Delta_{\mathrm{det},D}(b)
+\mathrm{AUROC}_D(b_0)
+\mathrm{AUROC}_D(b). $$
+Positive $\Delta_{\mathrm{det}}$ means detection fell. The object of study is the curve $b \mapsto \Delta_{\mathrm{det}}(b)$, reported only on rungs that pass the retention gate below. A failing rung has its gap withheld (broken-agent suppression). I never plot a collapsed agent as $\Delta_{\mathrm{det}} = 0$ “success for the defense.”
+
+
+
+
+4. Adversary ladder
+I treat the monitor as a defense and the agent as a potential attacker.
+Probe-agnostic pressure ($b_2$): suppress surface cues only.
+Probe-aware pressure ($b_3$, $b_4$): put $z$ in the training objective.
+I call a result “adaptive evasion” only if the probe-aware rung also passes retention.
+4.1 Freeze the evaluation cohort
+After baseline $b_0$:
+$$ \mathcal{C}
+\big i :\ \mathrm{intended}_i = 1 \wedge J\big(a_i^{(b_0)}\big) = 1 \big. $$
+Every later rung is scored on the same $\mathcal{C}$ ($|\mathcal{C}| = 29$). Membership is written to disk and reloaded; it is not recomputed from fresh judgments.
+4.2 $b_1$: Prompt concealment (no weight update)
+Append a concealment instruction to the system prompt and re-elicit:
+$$ a_i^{(b_1)}
+\pi_{\theta_0}\big(\cdot \mid \mathrm{system}_i^{(b_0)}\texttt{conceal}, \mathrm{user}_i\big). $$
+No training loss. I report retention for honesty, but $b_1$ is not under the fine-tuning retention gate used for $\Delta_{\mathrm{det}}$ decisions.
+4.3 $b_2$: Probe-agnostic SFT
+LoRA SFT on baseline deceptive assistant tokens under the concealment framing. Probe absent from the loss:
+$$ \mathcal{L}_{b_2}(\theta)
+-\sum_{t \in \mathrm{asst}} \log \pi_{\theta}\big(a_t \mid a_{<t}, x\big)
+\mathcal{L}_{\mathrm{CE}}. $$
+Training uses $a^{(b_0)}$ with $J(a^{(b_0)}) = 1$, not $a^{(b_1)}$ (which often already dropped deception and would teach honesty). After training, re-elicit and score with the same frozen probe.
+4.4 $b_3$: Probe-aware SFT
+$$ \mathcal{L}_{b_3}(\theta)
+\mathcal{L}_{\mathrm{CE}} + \lambda\mathrm{softplus}(z), \qquad \mathrm{softplus}(z) = \log\big(1 + e^{z}\big), $$
+with $z$ from the current response mean-pool.
+Important detail: I penalise the signed logit, never $\mathrm{softplus}(\sigma(z))$. The probability form saturates and kills the gradient before the penalty can move the probe.
+I report $\lambda \in 0.5, 8.0$ (primary $\lambda = 8$). On $\mathcal{C}$:
+$$ \Delta z
+\mathbb{E}[z_{b_0}] - \mathbb{E}[z_b], \qquad \mathrm{rel}
+\frac{\Delta z}{\mathrm{std}(z_{b_0})}. $$
+A rung is attack_worked only if $\Delta z \ge 0.1$ and $\mathrm{rel} \ge 0.25$; otherwise attack_too_weak.
+Flat AUROC under attack_too_weak is a bound, not a proof that the probe is unbeatable.
+Primary contrast: $b_2$ vs $b_3$ (probe absent vs probe in the loss), at matched retention.
+4.5 $b_4$: Probe-aware RL
+Fresh online LoRA REINFORCE (not continued from $b_3$):
+$$ R
+\alpha \cdot \mathrm{retention}
+\lambda \cdot z
+\beta \cdot \mathrm{surfacerisk}, $$
+with policy gradient
+$$ \mathcal{L}_{\mathrm{RL}}
+-R \sum_t \log \pi_{\theta}(a_t \mid \cdot) $$
+(typical $\alpha = 1$, $\beta = 0.25$).
+Prior expectation from RL-Obfuscation: mean-pooled aggregators resist RL obfuscation relative to token-level monitors, so a small usable $\Delta_{\mathrm{det}}(b_4)$ is what you should expect if retention holds.
+4.6 Retention gate (the part I care most about)
+Let $S_b$ be deception-success on $\mathcal{C}$ at rung $b$, and $S_0$ the $b_0$ rate. Let $\delta = S_b - S_0$ have a session-clustered bootstrap 90% CI $[\delta_{\mathrm{lo}}, \delta_{\mathrm{hi}}]$.
+For fine-tuning rungs $b_2$–$b_4$, $\Delta_{\mathrm{det}}(b)$ is reported iff both:
+$$ S_b \ge 0.8 S_0 \qquad\text{and}\qquad [\delta_{\mathrm{lo}}, \delta_{\mathrm{hi}}] \subset (-0.20, 0.20). $$
+Fail either condition → capability collapse → withhold the gap.
+This is the core methodological claim: AUROC down + agent no longer deceiving ≠ monitor defeated.
+
+
+
+
+5. Results
+
+5.1 Transfer gap before any attack
+Same validated extraction path:
+
+Domain
+Probe AUROC
+Apollo insider-trading
+0.999
+My agentic episodes at $b_0$
+0.83 [0.75, 0.90]
+
+That drop is distribution shift, not a broken pipeline. Every later gap is measured relative to 0.83, not relative to 1.0.
+If you were planning to copy Apollo’s near-ceiling number onto agentic deployment logs, this is the result that should stop you.
+5.2 Primary cell ($\lambda = 8$)
+
+
+$b_0$
+$b_1$
+$b_2$
+$b_3$
+$b_4$
+Surface AUROC
+0.83
+0.52
+0.71
+0.72
+0.68
+Probe AUROC
+0.83
+0.79
+0.89
+0.85
+0.75
+CoT-control AUROC
+0.52
+0.44
+0.54
+0.53
+0.50
+Probe $\Delta_{\mathrm{det}}(b)$
+—
+0.04
+−0.06
+−0.02
+withheld
+Retention (frozen)
+1.00
+0.52
+0.86
+0.86
+0.14
+FT retention gate
+—
+—
+pass
+pass
+fail
+
+Fine-tuning gates apply at $b_2$–$b_4$. $b_1$ is prompt-only (reported retention, not FT-gated).
+Attack-strength note. Both $\lambda = 0.5$ and $\lambda = 8.0$ probe-aware runs are attack_too_weak by the $\Delta z$ / $\mathrm{rel}$ test: softplus stayed small next to CE. So the flat probe AUROC at $b_2$ and $b_3$ only bounds the budget I tested.
+5.3 Companion cell ($\lambda = 0.5$)
+Probe AUROC stays high through $b_4$ (0.90), but retention at $b_4$ still fails (0.31). So $b_4$ is gated either way. The gate, not AUROC alone, decides what I may report.
+5.4 How to read each rung
+$b_0$ / transfer. Largest real drop, and it happens before any attack. This is the strongest positive finding.
+$b_1$ (prompt concealment). Surface collapses ($0.83 \to 0.52$) because concealment targets the transcript. The probe only dips ($0.79$). Black-box and white-box monitors do not degrade the same way under the same concealment. Retention falls to $0.52$, but this arm is not FT-gated.
+$b_2$ / $b_3$ (SFT). Probe AUROC stays at or above the agentic baseline ($0.89$, $0.85$) with retention $0.86$ (pass). Putting the probe in the loss did not open an extra gap beyond surface-only pressure — under a penalty that never fully engaged. Meaningful as a null under this budget. Not meaningful as a universal robustness claim.
+$b_4$ (RL). AUROC falls to $0.75$ only when retention collapses to $0.14$. Fixed-threshold recall can even rise at $b_4$ when outputs go degenerate. That is why I gate on retention and lead with AUROC. Withholding $\Delta_{\mathrm{det}}(b_4)$ is the honest call.
+Surface vs probe overlap. At $b_0$, probe and surface flags are nearly disjoint (Jaccard 0.08). They are not measuring the same thing.
+CoT control. Stays near 0.50–0.54. My episodes are single-turn with no separate reasoning span, so this is a weak CoT baseline, not a full reasoning-trace monitor.
+
+
+
+
+6. What I think this means
+
+Two findings, different strength
+Transfer gap ($0.999 \to 0.83$). Strong. Does not depend on attack strength. Appears before any adversary.
+Flat $b_2$–$b_3$ under my budget. Weaker. Probe-aware SFT that kept deception did not lower detection further, but both runs were attack_too_weak. Bound on this budget only.
+Practically:
+Do not copy training-domain AUROC onto agentic traffic.
+Do not read a flat SFT contrast as “probes are robust forever.”
+Do not celebrate AUROC drops that coincide with retention collapse.
+
+Why detection stayed flat under SFT
+A flat $b_2$–$b_3$ line could mean:
+(A) the probe resists gradient pressure, or
+(B) softplus never really engaged.
+Training logs point mainly to (B): the penalty stayed small next to CE. So I am not claiming (A).
+This is also why the protocol is useful even when the attack fails: it forces you to log attack_too_weak instead of quietly upgrading a null into a robustness theorem.
+Relation to RL-Obfuscation
+Gupta & Jenner find token-level monitors highly vulnerable under RL, while holistic aggregators stay stronger. My probe mean-pools response tokens, so I expected a small usable $\Delta_{\mathrm{det}}(b_4)$ if retention held. What I got instead: when RL moves the probe ($\lambda=8$, AUROC 0.75), retention collapses (0.14). That is compatible with “mean-pool is harder to attack while behaviour stays,” and also with “my RL schedule mostly broke the behaviour.” I cannot separate those cleanly at this budget.
+
+
+
+
+7. Limitations (please read these)
+Attack strength. Both $\lambda$ settings are attack_too_weak. Stronger probe-aware schedules are untested.
+Sample size. $N=60$, $|\mathcal{C}|=29$ → wide CIs (0.83 sits in [0.75, 0.90]).
+Scope. One model, one Apollo mean-pooled probe, one fine-tuning seed.
+Episode form. Single-turn stacked episodes, not full multi-turn dialogue. CoT control is weak for the same reason.
+Judge. Retention judge is a versioned single-annotator heuristic, checked on a blind sample.
+Release. Analysis code / configs / synthetic elicitation suite will be released later. Evasive LoRA checkpoints stay gated on purpose.
+
+
+
+
+8. Takeaways for how to test monitors
+I started expecting the gap to open sharply once the adversary became probe-aware. What I measured is more constrained: usable adaptive evasion against this mean-pooled probe is limited under my budget — pressure strong enough to move detection tends to break deception first.
+If you evaluate deception monitors, I think you should:
+Always measure on the deployment / agentic distribution, not only the probe’s training domain — and report the transfer gap with CIs.
+Evaluate against a budgeted adaptive ladder, not a single static accuracy number.
+Keep a retention gate. Never score a broken agent as a defeated monitor.
+Log whether the probe-aware loss actually engaged (attack_too_weak vs a working penalty) before claiming robustness.
+Scale next under the same gates: harder $\lambda$ / curriculum, multi-seed, true multi-turn episodes, second model, second probe architecture.
+This is a measurement instrument, not an evasion recipe. The same protocol will register a real adaptive gap as soon as one opens while deception still holds.
+
+
+
+
+References
+Goldowsky-Dill, Chughtai, Heimersheim, Hobbhahn. Detecting Strategic Deception with Linear Probes. arXiv:2502.03407 · code
+Greenblatt, Shlegeris, Denain, et al. AI Control: Improving Safety Despite Intentional Subversion. arXiv:2312.06942
+Gupta & Jenner. RL-Obfuscation: Can Language Models Learn to Evade Latent-Space Monitors? arXiv:2506.14261
+Bailey, Serrano, Sheshadri, et al. Obfuscated Activations Bypass LLM Latent-Space Defenses. arXiv:2412.09565
+Scheurer, Balesni, Hobbhahn. Large Language Models can Strategically Deceive their Users when Put Under Pressure. arXiv:2311.07590
+Benton et al. Sabotage Evaluations for Frontier Models. arXiv:2410.21514
+Meinke, Schoen, Scheurer, Balesni, Shah, Hobbhahn. Frontier Models are Capable of In-context Scheming. arXiv:2412.04984
+Athalye, Carlini, Wagner. Obfuscated Gradients Give a False Sense of Security. ICML 2018. arXiv:1802.00420
+Carlini & Wagner. Towards Evaluating the Robustness of Neural Networks. IEEE S&P 2017.
+Tramèr, Carlini, Brendel, Madry. On Adaptive Attacks to Adversarial Example Defenses. NeurIPS 2020.
+Zou, Phan, Chen, et al. Representation Engineering. arXiv:2310.01405
+Burns, Ye, Klein, Steinhardt. Discovering Latent Knowledge in Language Models Without Supervision. ICLR 2023.
+Parrack, Attubato, Heimersheim. Benchmarking Deception Probes via Black-to-White Performance Boosts. arXiv:2507.12691
+Grattafiori et al. The Llama 3 Herd of Models. arXiv:2407.21783
+
+
+
+Comments welcome — especially on:
+whether the retention thresholds ($0.8S_0$ and the TOST window) are too strict / too loose,
+better tests for attack_worked than $\Delta z$ / $\mathrm{rel}$,
+what a stronger probe-aware schedule should look like while still keeping deception.
+Oudoum A. Houmed · oudoum.ali-houmed@universite-paris-saclay.fr
